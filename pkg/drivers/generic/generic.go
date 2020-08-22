@@ -53,7 +53,7 @@ var (
 			GROUP BY mkv.name) maxkv
 	    ON maxkv.id = kv.id
 		WHERE
-			  (kv.deleted = 0 OR ?)
+			  kv.deleted = 0 OR kv.deleted = ?
 		ORDER BY kv.id ASC
 		`, revSQL, compactRevSQL, columns)
 )
@@ -67,6 +67,7 @@ func (s Stripped) String() string {
 
 type ErrRetry func(error) bool
 type TranslateErr func(error) error
+type TranslateLimit func(num int64) string
 
 type ConnectionPoolConfig struct {
 	MaxIdle     int           // zero means defaultMaxIdleConns; negative means 0
@@ -77,23 +78,26 @@ type ConnectionPoolConfig struct {
 type Generic struct {
 	sync.Mutex
 
-	LockWrites            bool
-	LastInsertID          bool
-	DB                    *sql.DB
-	GetCurrentSQL         string
-	GetRevisionSQL        string
-	RevisionSQL           string
-	ListRevisionStartSQL  string
-	GetRevisionAfterSQL   string
-	CountSQL              string
-	AfterSQL              string
-	DeleteSQL             string
-	UpdateCompactSQL      string
-	InsertSQL             string
-	FillSQL               string
-	InsertLastInsertIDSQL string
-	Retry                 ErrRetry
-	TranslateErr          TranslateErr
+	LockWrites             bool
+	LastInsertID           bool
+	InsertReturningInto    bool
+	DB                     *sql.DB
+	GetCurrentSQL          string
+	GetRevisionSQL         string
+	RevisionSQL            string
+	ListRevisionStartSQL   string
+	GetRevisionAfterSQL    string
+	CountSQL               string
+	AfterSQL               string
+	DeleteSQL              string
+	UpdateCompactSQL       string
+	InsertSQL              string
+	FillSQL                string
+	InsertLastInsertIDSQL  string
+	InsertReturningIntoSQL string
+	Retry                  ErrRetry
+	TranslateErr           TranslateErr
+	TranslateLimit         TranslateLimit
 }
 
 func q(sql, param string, numbered bool) string {
@@ -113,17 +117,14 @@ func q(sql, param string, numbered bool) string {
 }
 
 func (d *Generic) Migrate(ctx context.Context) {
-	var (
-		count     = 0
-		countKV   = d.queryRow(ctx, "SELECT COUNT(*) FROM key_value")
-		countKine = d.queryRow(ctx, "SELECT COUNT(*) FROM kine")
-	)
+	var count int64
 
-	if err := countKV.Scan(&count); err != nil || count == 0 {
+	if err := d.queryRow(ctx, "SELECT COUNT(*) FROM key_value").Scan(&count); err != nil || count == 0 {
+		logrus.WithError(err).Debug("no migration request demanded")
 		return
 	}
 
-	if err := countKine.Scan(&count); err != nil || count != 0 {
+	if err := d.queryRow(ctx, "SELECT COUNT(*) FROM kine").Scan(&count); err != nil || count != 0 {
 		return
 	}
 
@@ -234,20 +235,52 @@ func Open(ctx context.Context, driverName, dataSourceName string, connPoolConfig
 
 		FillSQL: q(`INSERT INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
 			values(?, ?, ?, ?, ?, ?, ?, ?, ?)`, paramCharacter, numbered),
+
+		InsertReturningIntoSQL: q(`INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+			values(?, ?, ?, ?, ?, ?, ?, ?) RETURNING id INTO ?`, paramCharacter, numbered),
 	}, err
 }
 
-func (d *Generic) query(ctx context.Context, sql string, args ...interface{}) (*sql.Rows, error) {
-	logrus.Tracef("QUERY %v : %s", args, Stripped(sql))
+var limitNum = regexp.MustCompile(`LIMIT[[:space:]]+(\d+)`)
+
+func (d *Generic) doTranslateLimit(sql string) string {
+	if d.TranslateLimit == nil {
+		return sql
+	}
+
+	return limitNum.ReplaceAllStringFunc(sql, func(s string) string {
+		// This should be a necessary condition
+		if n, err := strconv.ParseInt(limitNum.FindStringSubmatch(s)[1], 10, 64); err == nil {
+			return d.TranslateLimit(n)
+		} else {
+			// ???
+			panic(err)
+		}
+	})
+}
+
+func (d *Generic) query(ctx context.Context, sql string, args ...interface{}) (rows *sql.Rows, err error) {
+	sql = d.doTranslateLimit(sql)
+	logrus.
+		WithField("args", args).
+		WithField("sql", Stripped(sql)).
+		WithField("mode", nil).
+		Trace("query")
 	return d.DB.QueryContext(ctx, sql, args...)
 }
 
 func (d *Generic) queryRow(ctx context.Context, sql string, args ...interface{}) *sql.Row {
-	logrus.Tracef("QUERY ROW %v : %s", args, Stripped(sql))
+	sql = d.doTranslateLimit(sql)
+	logrus.
+		WithField("args", args).
+		WithField("sql", Stripped(sql)).
+		WithField("mode", "row").
+		Trace("query")
 	return d.DB.QueryRowContext(ctx, sql, args...)
 }
 
 func (d *Generic) execute(ctx context.Context, sql string, args ...interface{}) (result sql.Result, err error) {
+	sql = d.doTranslateLimit(sql)
 	if d.LockWrites {
 		d.Lock()
 		defer d.Unlock()
@@ -256,9 +289,17 @@ func (d *Generic) execute(ctx context.Context, sql string, args ...interface{}) 
 	wait := strategy.Backoff(backoff.Linear(100 + time.Millisecond))
 	for i := uint(0); i < 20; i++ {
 		if i > 2 {
-			logrus.Debugf("EXEC (try: %d) %v : %s", i, args, Stripped(sql))
+			logrus.
+				WithField("try", i).
+				WithField("args", args).
+				WithField("sql", Stripped(sql)).
+				Debug("exec")
 		} else {
-			logrus.Tracef("EXEC (try: %d) %v : %s", i, args, Stripped(sql))
+			logrus.
+				WithField("try", i).
+				WithField("args", args).
+				WithField("sql", Stripped(sql)).
+				Trace("exec")
 		}
 		result, err = d.DB.ExecContext(ctx, sql, args...)
 		if err != nil && d.Retry != nil && d.Retry(err) {
@@ -299,7 +340,13 @@ func (d *Generic) ListCurrent(ctx context.Context, prefix string, limit int64, i
 	if limit > 0 {
 		sql = fmt.Sprintf("%s LIMIT %d", sql, limit)
 	}
-	return d.query(ctx, sql, prefix, includeDeleted)
+	// don't ask me why, ask golang
+	return d.query(ctx, sql, prefix, func() int {
+		if includeDeleted {
+			return 1
+		}
+		return 0
+	}())
 }
 
 func (d *Generic) List(ctx context.Context, prefix, startKey string, limit, revision int64, includeDeleted bool) (*sql.Rows, error) {
@@ -308,14 +355,24 @@ func (d *Generic) List(ctx context.Context, prefix, startKey string, limit, revi
 		if limit > 0 {
 			sql = fmt.Sprintf("%s LIMIT %d", sql, limit)
 		}
-		return d.query(ctx, sql, prefix, revision, includeDeleted)
+		return d.query(ctx, sql, prefix, revision, func() int {
+			if includeDeleted {
+				return 1
+			}
+			return 0
+		}())
 	}
 
 	sql := d.GetRevisionAfterSQL
 	if limit > 0 {
 		sql = fmt.Sprintf("%s LIMIT %d", sql, limit)
 	}
-	return d.query(ctx, sql, prefix, revision, startKey, revision, includeDeleted)
+	return d.query(ctx, sql, prefix, revision, startKey, revision, func() int {
+		if includeDeleted {
+			return 1
+		}
+		return 0
+	}())
 }
 
 func (d *Generic) Count(ctx context.Context, prefix string) (int64, int64, error) {
@@ -380,6 +437,15 @@ func (d *Generic) Insert(ctx context.Context, key string, create, delete bool, c
 			return 0, err
 		}
 		return row.LastInsertId()
+	}
+
+	if d.InsertReturningInto {
+		_, err := d.execute(ctx, d.InsertReturningIntoSQL, key, cVal, dVal, createRevision, previousRevision, ttl, value, prevValue, sql.Out{Dest: &id})
+		if err != nil {
+			return 0, err
+		}
+		logrus.WithField("id", id).Debug("insert returning into")
+		return id, nil
 	}
 
 	row := d.queryRow(ctx, d.InsertSQL, key, cVal, dVal, createRevision, previousRevision, ttl, value, prevValue)
