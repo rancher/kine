@@ -10,11 +10,12 @@ import (
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+
 	"github.com/rancher/kine/pkg/drivers/generic"
 	"github.com/rancher/kine/pkg/logstructured"
 	"github.com/rancher/kine/pkg/logstructured/sqllog"
 	"github.com/rancher/kine/pkg/server"
-	"github.com/sirupsen/logrus"
 
 	// sqlite db driver
 	_ "github.com/mattn/go-sqlite3"
@@ -45,11 +46,9 @@ func New(ctx context.Context, dataSourceName string, connPoolConfig generic.Conn
 }
 
 func NewVariant(ctx context.Context, driverName, dataSourceName string, connPoolConfig generic.ConnectionPoolConfig) (server.Backend, *generic.Generic, error) {
-	if dataSourceName == "" {
-		if err := os.MkdirAll("./db", 0700); err != nil {
-			return nil, nil, err
-		}
-		dataSourceName = "./db/state.db?_journal=WAL&cache=shared"
+	dataSourceName, err := PrepareDSN(dataSourceName)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	dialect, err := generic.Open(ctx, driverName, dataSourceName, connPoolConfig, "?", false)
@@ -57,12 +56,7 @@ func NewVariant(ctx context.Context, driverName, dataSourceName string, connPool
 		return nil, nil, err
 	}
 	dialect.LastInsertID = true
-	dialect.TranslateErr = func(err error) error {
-		if err, ok := err.(sqlite3.Error); ok && err.ExtendedCode == sqlite3.ErrConstraintUnique {
-			return server.ErrKeyExists
-		}
-		return err
-	}
+	dialect.TranslateErr = TranslateError
 
 	// this is the first SQL that will be executed on a new DB conn so
 	// loop on failure here because in the case of dqlite it could still be initializing
@@ -82,12 +76,19 @@ func NewVariant(ctx context.Context, driverName, dataSourceName string, connPool
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "setup db")
 	}
-	//if err := setup(dialect.DB); err != nil {
+	// if err := setup(dialect.DB); err != nil {
 	//	return nil, nil, errors.Wrap(err, "setup db")
-	//}
+	// }
 
 	dialect.Migrate(context.Background())
 	return logstructured.New(sqllog.New(dialect)), dialect, nil
+}
+
+func TranslateError(err error) error {
+	if err, ok := err.(sqlite3.Error); ok && err.ExtendedCode == sqlite3.ErrConstraintUnique {
+		return server.ErrKeyExists
+	}
+	return err
 }
 
 func setup(db *sql.DB) error {
@@ -99,4 +100,14 @@ func setup(db *sql.DB) error {
 	}
 
 	return nil
+}
+
+func PrepareDSN(dataSourceName string) (string, error) {
+	if dataSourceName == "" {
+		if err := os.MkdirAll("./db", 0700); err != nil {
+			return "", err
+		}
+		dataSourceName = "./db/state.db?_journal=WAL&cache=shared"
+	}
+	return dataSourceName, nil
 }

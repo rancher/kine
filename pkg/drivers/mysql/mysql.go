@@ -6,6 +6,7 @@ import (
 	"database/sql"
 
 	"github.com/go-sql-driver/mysql"
+
 	"github.com/rancher/kine/pkg/drivers/generic"
 	"github.com/rancher/kine/pkg/logstructured"
 	"github.com/rancher/kine/pkg/logstructured/sqllog"
@@ -50,7 +51,7 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		tlsConfig.MinVersion = cryptotls.VersionTLS11
 	}
 
-	parsedDSN, err := prepareDSN(dataSourceName, tlsConfig)
+	parsedDSN, err := PrepareDSN(dataSourceName, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -64,18 +65,20 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		return nil, err
 	}
 	dialect.LastInsertID = true
-	dialect.TranslateErr = func(err error) error {
-		if err, ok := err.(*mysql.MySQLError); ok && err.Number == 1062 {
-			return server.ErrKeyExists
-		}
-		return err
-	}
+	dialect.TranslateErr = TranslateError
 	if err := setup(dialect.DB); err != nil {
 		return nil, err
 	}
 
 	dialect.Migrate(context.Background())
 	return logstructured.New(sqllog.New(dialect)), nil
+}
+
+func TranslateError(err error) error {
+	if err, ok := err.(*mysql.MySQLError); ok && err.Number == 1062 {
+		return server.ErrKeyExists
+	}
+	return err
 }
 
 func setup(db *sql.DB) error {
@@ -129,7 +132,7 @@ func createDBIfNotExist(dataSourceName string) error {
 	return nil
 }
 
-func prepareDSN(dataSourceName string, tlsConfig *cryptotls.Config) (string, error) {
+func PrepareDSN(dataSourceName string, tlsConfig *cryptotls.Config) (string, error) {
 	if len(dataSourceName) == 0 {
 		dataSourceName = defaultUnixDSN
 		if tlsConfig != nil {

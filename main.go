@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 
-	"github.com/rancher/kine/pkg/endpoint"
+	"github.com/pkg/math"
 	"github.com/rancher/wrangler/pkg/signals"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+
+	"github.com/rancher/kine/pkg/endpoint"
 )
 
 var (
@@ -15,10 +17,17 @@ var (
 )
 
 func main() {
+	cli.VersionFlag = cli.BoolFlag{
+		Name:  "version, V",
+		Usage: "print the version",
+	}
+
 	app := cli.NewApp()
 	app.Name = "kine"
 	app.Description = "Minimal etcd v3 API to support custom Kubernetes storage engines"
 	app.Usage = "Mini"
+	app.Version = "0.4.0"
+
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:        "listen-address",
@@ -63,7 +72,21 @@ func main() {
 			Usage:       "Key file for DB connection",
 			Destination: &config.KeyFile,
 		},
-		cli.BoolFlag{Name: "debug"},
+		cli.BoolFlag{
+			Name:  "debug",
+			Usage: "Enable debug mode for diagnostics",
+		},
+		cli.IntFlag{
+			Name:        "v, verbose",
+			Usage:       "Set the verbosity level (0=Panic Only, 1=Fatal, ..., 6=Trace)",
+			Value:       -1,
+			Destination: &config.Features.VerboseLevel,
+		},
+		cli.BoolFlag{
+			Name:        "alpha-use-new-backend",
+			Usage:       "Use the new experimental gorm based database backend",
+			Destination: &config.Features.UseAlphaBackend,
+		},
 	}
 	app.Action = run
 
@@ -74,8 +97,20 @@ func main() {
 
 func run(c *cli.Context) error {
 	if c.Bool("debug") {
-		logrus.SetLevel(logrus.DebugLevel)
+		if config.IsValidVerboseLevel() {
+			logrus.Warn("you've requested verbose level and debug mode together yourself, whoever is more verbose will be superseding")
+		}
+		config.Features.VerboseLevel = math.Max(config.Features.VerboseLevel, int(logrus.DebugLevel))
 	}
+
+	if config.IsValidVerboseLevel() {
+		logrus.SetLevel(logrus.Level(config.Features.VerboseLevel))
+	}
+
+	if config.Features.UseAlphaBackend {
+		logrus.Warn("you are using an experimental backend powered by gorm. it is not guaranteed everything will work for now")
+	}
+
 	ctx := signals.SetupSignalHandler(context.Background())
 	_, err := endpoint.Listen(ctx, config)
 	if err != nil {

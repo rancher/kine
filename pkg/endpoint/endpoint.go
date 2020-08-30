@@ -8,15 +8,24 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
+
+	"github.com/rancher/kine/pkg/alpha/gorm"
+	"github.com/rancher/kine/pkg/alpha/gorm/compat"
+	gormMssql "github.com/rancher/kine/pkg/drivers/alpha/gorm/mssql"
+	gormMysql "github.com/rancher/kine/pkg/drivers/alpha/gorm/mysql"
+	gormPgsql "github.com/rancher/kine/pkg/drivers/alpha/gorm/pgsql"
+	gormSqlite "github.com/rancher/kine/pkg/drivers/alpha/gorm/sqlite"
 	"github.com/rancher/kine/pkg/drivers/dqlite"
 	"github.com/rancher/kine/pkg/drivers/generic"
 	"github.com/rancher/kine/pkg/drivers/mysql"
 	"github.com/rancher/kine/pkg/drivers/pgsql"
 	"github.com/rancher/kine/pkg/drivers/sqlite"
+	"github.com/rancher/kine/pkg/logstructured"
+	"github.com/rancher/kine/pkg/logstructured/sqllog"
 	"github.com/rancher/kine/pkg/server"
 	"github.com/rancher/kine/pkg/tls"
-	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
 )
 
 const (
@@ -26,6 +35,7 @@ const (
 	ETCDBackend     = "etcd3"
 	MySQLBackend    = "mysql"
 	PostgresBackend = "postgres"
+	MsSQLBackend    = "sqlserver"
 )
 
 type Config struct {
@@ -33,8 +43,15 @@ type Config struct {
 	Listener             string
 	Endpoint             string
 	ConnectionPoolConfig generic.ConnectionPoolConfig
-
+	Features             struct {
+		VerboseLevel    int
+		UseAlphaBackend bool
+	}
 	tls.Config
+}
+
+func (c *Config) IsValidVerboseLevel() bool {
+	return c.Features.VerboseLevel >= 0
 }
 
 type ETCDConfig struct {
@@ -123,6 +140,14 @@ func getKineStorageBackend(ctx context.Context, driver, dsn string, cfg Config) 
 		leaderElect = true
 		err         error
 	)
+
+	if cfg.Features.UseAlphaBackend {
+		if retLeaderElect, backend, err := createKineStorageAlphaBackend(ctx, driver, dsn, cfg); err == nil {
+			return retLeaderElect, backend, err
+		}
+		logrus.Warn("unable to create alpha backend, falling back to use standard backend")
+	}
+
 	switch driver {
 	case SQLiteBackend:
 		leaderElect = false
@@ -138,6 +163,42 @@ func getKineStorageBackend(ctx context.Context, driver, dsn string, cfg Config) 
 	}
 
 	return leaderElect, backend, err
+}
+
+func createKineStorageAlphaBackend(ctx context.Context, driverPrefix string, dsn string, cfg Config) (leaderElect bool, backend server.Backend, err error) {
+	var driver gorm.Driver
+	switch driverPrefix {
+	case SQLiteBackend:
+		leaderElect = false
+		driver = &gormSqlite.Driver{}
+	case PostgresBackend:
+		leaderElect = true
+		driver = &gormPgsql.Driver{}
+	case MySQLBackend:
+		leaderElect = true
+		driver = &gormMysql.Driver{}
+	case MsSQLBackend:
+		leaderElect = true
+		driver = &gormMssql.Driver{}
+	default:
+		err = fmt.Errorf("storage backend is not defined")
+		return
+	}
+	dsn, err = driver.PrepareDSN(dsn, cfg.Config)
+	if err != nil {
+		return
+	}
+	dialector := driver.GetOpenFunctor()(dsn)
+	dbBackend, err := gorm.New(ctx, dialector, driver)
+	if err != nil {
+		return
+	}
+	compatBackend, err := compat.New(dbBackend)
+	if err != nil {
+		return
+	}
+	backend = logstructured.New(sqllog.New(compatBackend))
+	return
 }
 
 func ParseStorageEndpoint(storageEndpoint string) (string, string) {

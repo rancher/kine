@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/lib/pq"
+
 	"github.com/rancher/kine/pkg/drivers/generic"
 	"github.com/rancher/kine/pkg/logstructured"
 	"github.com/rancher/kine/pkg/logstructured/sqllog"
@@ -42,7 +43,7 @@ var (
 )
 
 func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoolConfig generic.ConnectionPoolConfig) (server.Backend, error) {
-	parsedDSN, err := prepareDSN(dataSourceName, tlsInfo)
+	parsedDSN, err := PrepareDSN(dataSourceName, tlsInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -55,12 +56,7 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 	if err != nil {
 		return nil, err
 	}
-	dialect.TranslateErr = func(err error) error {
-		if err, ok := err.(*pq.Error); ok && err.Code == "23505" {
-			return server.ErrKeyExists
-		}
-		return err
-	}
+	dialect.TranslateErr = TranslateError
 
 	if err := setup(dialect.DB); err != nil {
 		return nil, err
@@ -68,6 +64,13 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 
 	dialect.Migrate(context.Background())
 	return logstructured.New(sqllog.New(dialect)), nil
+}
+
+func TranslateError(err error) error {
+	if err, ok := err.(*pq.Error); ok && err.Code == "23505" {
+		return server.ErrKeyExists
+	}
+	return err
 }
 
 func setup(db *sql.DB) error {
@@ -128,7 +131,7 @@ func q(sql string) string {
 	})
 }
 
-func prepareDSN(dataSourceName string, tlsInfo tls.Config) (string, error) {
+func PrepareDSN(dataSourceName string, tlsInfo tls.Config) (string, error) {
 	if len(dataSourceName) == 0 {
 		dataSourceName = defaultDSN
 	} else {
